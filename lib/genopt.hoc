@@ -1,0 +1,329 @@
+// nFit
+// (c) Charles CH Cohen, 2014-present
+// this software is released to the public under a Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 
+// International license (CC BY-NC-ND 4.0, in English).
+// for any questions, please email c.cohen@gmx.com
+
+
+
+// -------------------------------------Variables-----------------------------------------
+objref pc
+objref svec, vvec
+objref pmat, vmat, emat, tmat, errloglist, paramquadlist, paramloglist
+
+pc = new ParallelContext()
+
+strdef tsimstr
+
+ncpu = pc.nhost
+// number of genetic divisions into which each paramater's parameter space 
+// will be distributed.
+nd = 2
+// number of "genetic" cable parameters which enable thorough stochastic sampling of their
+// parameter spaces. Excludes Cpip, which is not considered a "genetic" parameter, as it 
+// is weakly-constrained in well-compensated conditions. Therefore, its initial value is
+// fixed.
+ns = nd^(getnp()-1)
+// Maximum computational efficiency on supercomputers is ensured when ns (ideally total) 
+// is <= 2^10
+simax = 2^10
+// ---------------------------------------------------------------------------------------
+
+
+
+// -------------------------------------genopt--------------------------------------------
+// function which organizes genetic optimizations
+func genopt() {local p, iiamp
+
+	// $1 corresponds to the row number of rpmat being simulated
+	// $2 corresponds to given amplitude position in iampvec
+	// hoc_ac_ corresponds to an internal sim ID used to pack parallel sim outputs
+	// $4 corresponds to whether massive parallel or massive serial opt
+	
+	// reseticlamp and changedata
+	reseticlamp(iampvec.x[$2], 1)
+		
+	// assign rand params to each ind sim
+	for p = 0, $o3.size-1 RunFitParm[p].val = $o3.x[p]
+
+	if (!4) {
+
+		nquad = 0
+		nefun = 0
+		nefunvec = new Vector()
+		time = 0
+		errlogvec = new Vector()
+		paramquadvec = new Vector()
+		paramlogvec = new Vector()
+	}
+
+	$o7.resize(0)
+	$o8.resize(0)
+	$o9.resize(0)
+
+	optimizem($5, $6, $o7, $o8, $o9, $2, $1, hoc_ac_, $10, $11)
+
+	return 1
+}
+// ---------------------------------------------------------------------------------------
+
+
+
+// -----------------------------------optimizem-------------------------------------------
+proc optimizem() {local p, f, k localobj svec, vvec, boundvec, tempxvec
+
+	// variable tracking whether this optimize procedure is running
+	fitoff = 0
+	// minimum nquad
+	MulfitPraxWrap[1].nstep = 1
+	// set attributes of praxis
+	attr_praxis($1, $2, 0)
+	// start optimization.
+	MulRunFitter[0].prun()
+
+	// exit strategy
+	while (!fitoff) {
+		
+		// optimization variables of interest
+		nquad += 1
+		nefunvec.append(MulRunFitter[0].opt.nefun)
+		time += MulRunFitter[0].opt.time
+		// error and parameter logging
+		$o3.resize($o3.size+nf+1)
+		for f = 0, nf-1 {
+			$o3.x[$o3.size-(nf+1)+f] = RegionFitness[f].ydat_.meansqerr(FitnessGenerator[0].yveclist.o(f), RegionFitness[f].dw_)
+			$o3.x[$o3.size-1] += $o3.x[$o3.size-(nf+1)+f]
+		}
+		$o4.resize($o4.size+getnp())
+		for p = 0, getnp()-1 $o4.x[$o4.size-getnp()+p] = RunFitParm[p].val
+
+		// IF the error is in the noise...
+		if ($o3.x[$o3.size-1] < $1) {
+			
+			nefun = nefunvec.sum
+			print "total: nquad=", nquad, "nefun=", nefun, "time=", time, "e=", MulfitPraxWrap[1].minerr
+			time = setnsig(time/3600, 2)
+			sprint(tsimstr, "%g", time)
+			sprint(ampstr, "%g%s", iampvec.x[$6]*1000, "pA")
+			print "Simulation ", $7, "of ", $9, "for ", ampstr, " completed in ", tsimstr, " hour(s)"
+			// exit codes
+			$o3.resize($o3.size+2)
+			$o3.x[$o3.size-2] = $1
+			$o3.x[$o3.size-1] = -1-1-1
+			$o4.resize($o4.size+1)
+			$o4.x[$o4.size-1] = -getnp()-1
+			$o5.resize(paramlogvec.size)
+			for k = 0, $o5.size-1 $o5.x[k] = paramlogvec.x[k]
+			// store optimized parameters
+			svec = new Vector()
+			for p = 0, getnp()-1 svec.append($o4.x[$o4.size+$o4.x[$o4.size-1]+p])
+			// print to sdout optimized parameters
+			for p = 0, getnp()-1 {
+				sprint(tempstr, "%g", svec.x[p]*plowvec.x[p])
+				print pnamelist.o(p).label, "= ", tempstr
+			}
+			// store sim time
+			svec.append(time)
+			// store optimized v
+			vvec = new Vector()
+			for f = 0, nf-1 {
+
+				// if boundaries are different from default, output full trace v
+				if (RegionFitness[f].boundary.x[0] > RegionFitness[f].xdat.x[0] || RegionFitness[f].boundary.x[RegionFitness[f].boundary.size-1] < RegionFitness[f].xdat.x[RegionFitness[f].xdat.size-1] || RegionFitness[f].boundary.size > 2) {
+
+					// save previous boundaries
+					boundvec = new Vector()
+					boundvec.append(RegionFitness[f].boundary)
+
+					// set new (default) boundaries
+					RegionFitness[f].boundary = new Vector()
+					RegionFitness[f].boundary.append(RegionFitness[f].xdat.x[0], RegionFitness[f].xdat.x[RegionFitness[f].xdat.size-1])
+					
+					// make these new boundaries effective (must use different xdat vector)
+					tempxvec = new Vector()
+					tempxvec.append(RegionFitness[f].xdat)
+					RegionFitness[f].set_modelx(tempxvec)
+
+					// get default optimized voltage trace
+					FitnessGenerator[0].efun()
+					vvec.append(FitnessGenerator[0].yveclist.o(f))
+
+					// restore original bounds
+					RegionFitness[f].boundary = new Vector()
+					RegionFitness[f].boundary.append(boundvec)
+					RegionFitness[f].set_modelx(tempxvec)
+				
+				} else {
+
+					vvec.append(FitnessGenerator[0].yveclist.o(f))
+				}
+			}
+			// output simulation data
+			data_out($8, $7, $6, svec, vvec, $o3, $o4, $o5, $9, $10)
+			// exit optimization
+			fitoff = 1
+
+		} else if ($o3.size > 2*(nf+1)) {
+				
+			// NEURON does not allow the merging of these just above and just below conditions because 
+			// it checks each one even if one of them - in this case the first - is false. In other words,
+			// it will check the first, it is false, does not exit the condition, goes on to check the second,
+			// which may throw an error because errlogvec is not that size yet...
+			// IF the error improvement is in the noise...
+			if (abs($o3.x[$o3.size-1] - $o3.x[$o3.size-2-nf]) < $1) {
+			
+				// NEURON cannot handle compound conditional statements in general (it probably does not recognize the internal bracket delimiter). Therefore, each boolean binary 
+				// substatement must be separately determined, i.e. if (A && (B || C)) is not possible. One must instead write: if (A) -> if (B || C).
+				// IF the error improvement is marginal...
+				if (abs($o3.x[$o3.size-1] - $o3.x[$o3.size-2-nf]) < abs($o3.x[$o3.size-2-nf] - $o3.x[$o3.size-3-2*nf]) || abs($o3.x[$o3.size-1] - $o3.x[$o3.size-2-nf]) < 1e-6) {
+			
+					nquad -= 1
+					nefun = nefunvec.sum-nefunvec.x[nefunvec.size-1]
+					print "total: nquad=", nquad, "nefun=", nefun, "time=", time, "e=", $o3.x[$o3.size-nf-1-1]
+					time = setnsig(time/3600, 2)
+					sprint(tsimstr, "%g", time)
+					sprint(ampstr, "%g%s", iampvec.x[$6]*1000, "pA")
+					print "Simulation ", $7, "of ", $9, "for ", ampstr, " completed in ", tsimstr, " hours"
+					// exit codes
+					$o3.resize($o3.size+2)
+					$o3.x[$o3.size-2] = $1
+					$o3.x[$o3.size-1] = -nf-1-1-1-1
+					$o4.resize($o4.size+1)
+					$o4.x[$o4.size-1] = -2*getnp()-1
+					$o5.resize(paramlogvec.size)
+					for k = 0, $o5.size-1 $o5.x[k] = paramlogvec.x[k]
+					// store optimized parameters
+					svec = new Vector()
+					for p = 0, getnp()-1 svec.append($o4.x[$o4.size+$o4.x[$o4.size-1]+p])
+					// print to sdout optimized parameters
+					for p = 0, getnp()-1 {
+						sprint(tempstr, "%g", svec.x[p]*plowvec.x[p])
+						print pnamelist.o(p).label, "= ", tempstr
+					}
+					// store sim time
+					svec.append(time)
+					// store optimized v
+					vvec = new Vector()
+					for f = 0, nf-1 {
+
+						// if boundaries are different from default, output full trace v
+						if (RegionFitness[f].boundary.x[0] > RegionFitness[f].xdat.x[0] || RegionFitness[f].boundary.x[RegionFitness[f].boundary.size-1] < RegionFitness[f].xdat.x[RegionFitness[f].xdat.size-1] || RegionFitness[f].boundary.size > 2) {
+
+							// save previous boundaries
+							boundvec = new Vector()
+							boundvec.append(RegionFitness[f].boundary)
+
+							// set new (default) boundaries
+							RegionFitness[f].boundary = new Vector()
+							RegionFitness[f].boundary.append(RegionFitness[f].xdat.x[0], RegionFitness[f].xdat.x[RegionFitness[f].xdat.size-1])
+							
+							// make these new boundaries effective (must use different xdat vector)
+							tempxvec = new Vector()
+							tempxvec.append(RegionFitness[f].xdat)
+							RegionFitness[f].set_modelx(tempxvec)
+
+							// get default optimized voltage trace
+							FitnessGenerator[0].efun()
+							vvec.append(FitnessGenerator[0].yveclist.o(f))
+
+							// restore original bounds
+							RegionFitness[f].boundary = new Vector()
+							RegionFitness[f].boundary.append(boundvec)
+							RegionFitness[f].set_modelx(tempxvec)
+						
+						} else {
+
+							vvec.append(FitnessGenerator[0].yveclist.o(f))
+						}
+					}
+					// output simulation data
+					data_out($8, $7, $6, svec, vvec, $o3, $o4, $o5, $9, $10)
+					// exit optimization
+					fitoff = 1
+				}
+			}
+			
+		} else {
+			
+			nefun = nefunvec.sum
+			print "total: nquad=", nquad, "nefun=", nefun, "time=", time, "e=", MulfitPraxWrap[1].minerr
+			optimizem($1, $2, $o3, $o4, $o5, $6, $7, $8, $9, $10)
+		}
+	}
+}
+// ---------------------------------------------------------------------------------------
+
+
+
+// ------------------------------------data_out-------------------------------------------
+// post output data from each simulation, parallel or otherwise
+// $1 = myID. Only used to post parallel jobs.
+// $2 = ind = row index = 0,...,ns.
+// $3 = iiamp = 0, niamp-1.
+// $o4 = svec. Contains parameters from 0 to np-1. 
+// then tsim.
+// $o5 = vvec. Contains all v from 0 to nf*nrows,
+// where nrows is fixed (unlike np).
+// $o6 = errlogvec. sim errors from nquad = 0,...,n.
+// first individual fit errors from (nf)
+// then total fit error (sum(0,...,nf-1)).
+// exitcode (errlogvec.x[size-1]) instructs error
+// $o7 = paramquadvec. np pnorm from nquad = 0,...,n.
+// $o8 = paramlogvec. plog over every run (at setind)
+// $9 = scount
+// $10 = istart
+proc data_out() {
+
+	if (ncpu == 1) {
+
+		serpack($2, $10, $9, $o4, $o5, $o6)
+
+	} else {
+
+		pc.post($1, pc.pack($2, $10, $o4, $o5, $o6, $o7, $o8))
+	}
+}
+// ---------------------------------------------------------------------------------------
+
+
+
+// ------------------------------------serpack--------------------------------------------
+// $1 = ind
+// $2 = relative iiamp
+// $3 = scount
+// $o4 = svec
+// $o5 = vvec
+// $o6 = errlogvec
+proc serpack() {local p, f, k, kstart, kend, ind, istart, scount, setind
+
+	ind = $1
+	istart = $2
+	scount = $3
+	// assign output parameters to pmat
+	// pmat is organized as follows:
+	// each iamp from rows 0-scount at (relative iiamp position)*(rows 0-scount)
+	// ind determines which row
+	setind = istart*(scount+1)+ind
+	// copy p from svec into pmat
+	for p = 0, getnp()-1 pmat.x[setind][p] = $o4.x[p]
+	// next from svec: tsim
+	tmat.x[setind][0] = $o4.x[getnp()]
+	// extract v from vvec into vmat, which already contains
+	// tdatvec at col 0.
+	for f = 0, nf-1 {
+
+		kstart = f*nrows
+		for k = 0, nrows-1 vmat.x[k][istart*nf*(scount+1)+nf*ind+f] =  $o5.x[kstart+k]
+	}
+	// emat: individual errors in cols 0,nf-1
+	for f = 0, nf-1 emat.x[setind][f] = $o6.x[$o6.size+$o6.x[$o6.size-1]-nf+f]
+	// add total error at col nf
+	emat.x[setind][nf] = $o6.x[$o6.size+$o6.x[$o6.size-1]]
+	// add tol at col nf+1
+	emat.x[setind][nf+1] = $o6.x[$o6.size-1-1]
+}
+// ---------------------------------------------------------------------------------------
+
+// this is where parallized information available to slaves ends
+pc.runworker()
+// ---------------------------------------------------------------------------------------
