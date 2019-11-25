@@ -1,4 +1,5 @@
 To run a model for the first time:
+	- Download and install NEURON.
 	- Import cellular morphology via getmorph.hoc.
 	- Load morphology with loadmorph.hoc to identify recorded sections
 	- Run setup.hoc
